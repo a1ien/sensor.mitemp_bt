@@ -14,6 +14,7 @@ CONF_HCI_INTERFACE = "hci_interface"
 CONF_BATT_ENTITIES = "batt_entities"
 CONF_ENCRYPTORS = "encryptors"
 CONF_REPORT_UNKNOWN = "report_unknown"
+CONF_EXTENDED_SCAN = "extended_scan"
 CONF_WHITELIST = "whitelist"
 
 # Default values for configuration options
@@ -25,6 +26,7 @@ DEFAULT_USE_MEDIAN = False
 DEFAULT_ACTIVE_SCAN = False
 DEFAULT_HCI_INTERFACE = 0
 DEFAULT_BATT_ENTITIES = False
+DEFAULT_EXTENDED_SCAN = False
 DEFAULT_REPORT_UNKNOWN = False
 DEFAULT_WHITELIST = False
 

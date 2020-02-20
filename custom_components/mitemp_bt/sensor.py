@@ -42,6 +42,7 @@ from .const import (
     DEFAULT_HCI_INTERFACE,
     DEFAULT_BATT_ENTITIES,
     DEFAULT_REPORT_UNKNOWN,
+    DEFAULT_EXTENDED_SCAN,
     DEFAULT_WHITELIST,
     CONF_ROUNDING,
     CONF_DECIMALS,
@@ -53,6 +54,7 @@ from .const import (
     CONF_BATT_ENTITIES,
     CONF_ENCRYPTORS,
     CONF_REPORT_UNKNOWN,
+    CONF_EXTENDED_SCAN,
     CONF_WHITELIST,
     CONF_TMIN,
     CONF_TMAX,
@@ -90,6 +92,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_BATT_ENTITIES, default=DEFAULT_BATT_ENTITIES): cv.boolean,
         vol.Optional(CONF_ENCRYPTORS, default={}): ENCRYPTORS_LIST_SCHEMA,
         vol.Optional(CONF_REPORT_UNKNOWN, default=DEFAULT_REPORT_UNKNOWN): cv.boolean,
+        vol.Optional(CONF_EXTENDED_SCAN, default=DEFAULT_EXTENDED_SCAN): cv.boolean,
         vol.Optional(
             CONF_WHITELIST, default=DEFAULT_WHITELIST
         ): vol.Any(vol.All(cv.ensure_list, [cv.matches_regex(MAC_REGEX)]), cv.boolean),
@@ -104,16 +107,92 @@ CND_STRUCT = struct.Struct("<H")
 ILL_STRUCT = struct.Struct("<I")
 FMDH_STRUCT = struct.Struct("<H")
 
+class HCI_Cmd_LE_Set_Ext_Scan_Params(aiobs.HCI_Command):
+
+    def __init__(self, scan_type=0x0,interval=10, window=750, oaddr_type=0,filter=0):
+        super(self.__class__, self).__init__(b"\x08",b"\x41")
+        self.payload.append(aiobs.EnumByte("own addresss type",oaddr_type,
+                                           {0: "Public",
+                                            1: "Random",
+                                            2: "Private IRK or Public",
+                                            3: "Private IRK or Random"}))
+        self.payload.append(aiobs.EnumByte("filter policy",filter,
+                                           {0: "None",
+                                            1: "Sender In White List",
+                                            2: "Almost None",
+                                            3: "SIWL and some"}))
+
+        self.payload.append(aiobs.EnumByte("primary phy",1,{1:"LE 1M", 3:"LE Coded"}))
+        self.payload.append(aiobs.EnumByte("scan type",scan_type,
+                                           {0: "Passive",
+                                            1: "Active"}))
+        self.payload.append(aiobs.UShortInt("Interval",int(round(min(10240,max(2.5,interval))/0.625)),endian="little"))
+        self.payload.append(aiobs.UShortInt("Window",int(round(min(10240,max(2.5,min(interval,window)))/0.625)),endian="little"))
+
+class HCI_Cmd_LE_Ext_Scan_Enable(aiobs.HCI_Command):
+    """Class representing a command HCI command to enable/disable BLE scanning.
+        :param enable: enable/disable scanning.
+        :type enable: bool
+        :param filter_dups: filter duplicates.
+        :type filter_dups: bool
+        :returns: HCI_Cmd_LE_Scan_Enable instance.
+        :rtype: HCI_Cmd_LE_Scan_Enable
+    """
+
+    def __init__(self,enable=True,filter_dups=True,duration=0,period=0):
+        super(self.__class__, self).__init__(b"\x08",b"\x42")
+        self.payload.append(aiobs.Bool("enable",enable))
+        self.payload.append(aiobs.Bool("filter",filter_dups))
+        self.payload.append(aiobs.UShortInt("Duration",int(round(min(10240,max(2.5,duration))/0.625)),endian="little"))
+        self.payload.append(aiobs.UShortInt("Period",int(round(min(10240,max(2.5,period))/0.625)),endian="little"))
+
+class BLEScanRequester(asyncio.Protocol):
+    '''Protocol handling the requests'''
+    def __init__(self):
+        self.transport = None
+        self.smac = None
+        self.sip = None
+        self.process = self.default_process
+
+    def connection_made(self, transport):
+        self.transport = transport
+        command=HCI_Cmd_LE_Set_Ext_Scan_Params()
+        self.transport.write(command.encode())
+
+    def connection_lost(self, exc):
+        super().connection_lost(exc)
+
+    def send_scan_request(self):
+        '''Sending LE scan request'''
+        command=HCI_Cmd_LE_Ext_Scan_Enable(True,False)
+        self.transport.write(command.encode())
+
+    def stop_scan_request(self):
+        '''Sending LE scan request'''
+        command=HCI_Cmd_LE_Ext_Scan_Enable(False,False)
+        self.transport.write(command.encode())
+
+    def send_command(self,command):
+        '''Sending an arbitrary command'''
+        self.transport.write(command.encode())
+
+    def data_received(self, packet):
+        self.process(packet)
+
+    def default_process(self,data):
+        pass
+
 
 class HCIdump(Thread):
     """Mimic deprecated hcidump tool."""
 
-    def __init__(self, dumplist, interface=0, active=0):
+    def __init__(self, dumplist, interface=0, active=0, extended_scan=False):
         """Initiate HCIdump thread."""
         Thread.__init__(self)
         _LOGGER.debug("HCIdump thread: Init")
         self._interface = interface
         self._active = active
+        self._extended_scan = extended_scan
         self.dumplist = dumplist
         self._event_loop = None
         _LOGGER.debug("HCIdump thread: Init finished")
@@ -133,15 +212,17 @@ class HCIdump(Thread):
             self._event_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._event_loop)
             fac = self._event_loop._create_connection_transport(
-                mysocket, aiobs.BLEScanRequester, None, None
+                mysocket, BLEScanRequester if self._extended_scan else aiobs.BLEScanRequester, None, None
             )
             _LOGGER.debug("HCIdump thread: Connection")
             conn, btctrl = self._event_loop.run_until_complete(fac)
             _LOGGER.debug("HCIdump thread: Connected")
             btctrl.process = self.process_hci_events
-            btctrl.send_command(
-                aiobs.HCI_Cmd_LE_Set_Scan_Params(scan_type=self._active)
-            )
+            if self._extended_scan:
+                command = HCI_Cmd_LE_Set_Ext_Scan_Params(scan_type=self._active)
+            else:
+                command = aiobs.HCI_Cmd_LE_Set_Scan_Params(scan_type=self._active)
+            btctrl.send_command(command)
             btctrl.send_scan_request()
             _LOGGER.debug("HCIdump thread: start main event_loop")
             try:
@@ -226,14 +307,16 @@ def decrypt_payload(encrypted_payload, key, nonce):
 
 def parse_raw_message(data, aeskeyslist,  whitelist, report_unknown=False):
     """Parse the raw data."""
+    is_ext_packet = True if data[3] == 0x0d else False
     if data is None:
         return None
     # check for Xiaomi service data
-    xiaomi_index = data.find(b'\x16\x95\xFE', 15)
+    xiaomi_index = data.find(b'\x16\x95\xFE', 15 + 15 if is_ext_packet else 0)
     if xiaomi_index == -1:
         return None
     # check for no BR/EDR + LE General discoverable mode flags
-    adv_index = data.find(b"\x02\x01\x06", 14, 17)
+    advert_start = 29 if is_ext_packet else 14
+    adv_index = data.find(b"\x02\x01\x06", advert_start, 3 + advert_start)
     if adv_index == -1:
         return None
     # check for BTLE msg size
@@ -242,7 +325,8 @@ def parse_raw_message(data, aeskeyslist,  whitelist, report_unknown=False):
         return None
     # check for MAC presence in message and in service data
     xiaomi_mac_reversed = data[xiaomi_index + 8:xiaomi_index + 14]
-    source_mac_reversed = data[adv_index - 7:adv_index - 1]
+    mac_index = adv_index - 14 if is_ext_packet else adv_index
+    source_mac_reversed = data[mac_index - 7:mac_index - 1]
     if xiaomi_mac_reversed != source_mac_reversed:
         return None
     # check for MAC presence in whitelist, if needed
@@ -250,7 +334,8 @@ def parse_raw_message(data, aeskeyslist,  whitelist, report_unknown=False):
         if xiaomi_mac_reversed not in whitelist:
             return None
     # extract RSSI byte
-    (rssi,) = struct.unpack("<b", data[msg_length - 1:msg_length])
+    rssi_index = 18 if is_ext_packet else msg_length - 1
+    (rssi,) = struct.unpack("<b", data[rssi_index:rssi_index + 1])
     #strange positive RSSI workaround
     if rssi > 0:
         rssi = -rssi
@@ -368,6 +453,7 @@ class BLEScanner:
         """Start receiving broadcasts."""
         active_scan = config[CONF_ACTIVE_SCAN]
         hci_interfaces = config[CONF_HCI_INTERFACE]
+        extended_scan = config[CONF_EXTENDED_SCAN]
         self.hcidump_data.clear()
         _LOGGER.debug("Spawning HCIdump thread(s).")
         for hci_int in hci_interfaces:
@@ -375,6 +461,7 @@ class BLEScanner:
                 dumplist=self.hcidump_data,
                 interface=hci_int,
                 active=int(active_scan is True),
+                extended_scan=extended_scan
             )
             self.dumpthreads.append(dumpthread)
             _LOGGER.debug("Starting HCIdump thread for hci%s", hci_int)
